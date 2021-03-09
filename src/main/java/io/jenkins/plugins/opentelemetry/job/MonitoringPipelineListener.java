@@ -73,7 +73,8 @@ public class MonitoringPipelineListener extends AbstractPipelineListener impleme
 
             Span stageSpan = getTracer().spanBuilder("Stage: " + stageName)
                     .setParent(Context.current())
-                    .setAttribute("jenkins.pipeline.step.type", stepStartNode.getDisplayFunctionName())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE, stepStartNode.getDisplayFunctionName())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_ID, stepStartNode.getId())
                     .startSpan();
             LOGGER.log(Level.FINE, () -> run.getFullDisplayName() + " - stage(" + stageName + ") - begin " + OtelUtils.toDebugString(stageSpan));
 
@@ -98,22 +99,27 @@ public class MonitoringPipelineListener extends AbstractPipelineListener impleme
             String principal = Objects.toString(node.getExecution().getAuthentication().getPrincipal(), "#null#");
             LOGGER.log(Level.FINE, () -> node.getDisplayFunctionName() + " - principal: " + principal);
 
-            SpanBuilder spanBuilder = getTracer().spanBuilder(node.getDisplayFunctionName())
-                    .setParent(Context.current())
-                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE, node.getDisplayFunctionName())
-                    .setAttribute(JenkinsOtelSemanticAttributes.CI_PIPELINE_RUN_USER, principal);
 
+
+            SpanBuilder spanBuilder = null;
             for (StepHandler stepHandler : ExtensionList.lookup(StepHandler.class)) {
-                if (stepHandler.canHandle(node)) {
+                if (stepHandler.canCreateSpanBuilder(node)) {
                     try {
-                        stepHandler.handle(node, spanBuilder);
+                        stepHandler.createSpanBuilder(node, getTracer());
                     } catch (Exception e) {
                         LOGGER.log(Level.WARNING, run.getFullDisplayName() + " failure to handle step " + node + " with handler " + stepHandler, e);
                     }
                     break;
                 }
             }
-
+            if (spanBuilder == null) {
+                spanBuilder = getTracer().spanBuilder(node.getDisplayFunctionName());
+            }
+            spanBuilder.setParent(Context.current())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE, node.getDisplayFunctionName())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_ID, node.getId())
+                    .setAttribute(JenkinsOtelSemanticAttributes.CI_PIPELINE_RUN_USER, principal)
+            .setAttribute("", node.getId());
             Span atomicStepSpan = spanBuilder.startSpan();
             LOGGER.log(Level.FINE, () -> run.getFullDisplayName() + " - > " + node.getDisplayFunctionName() + " - begin " + OtelUtils.toDebugString(atomicStepSpan));
 
@@ -146,7 +152,8 @@ public class MonitoringPipelineListener extends AbstractPipelineListener impleme
 
             Span atomicStepSpan = getTracer().spanBuilder("Parallel branch: " + branchName)
                     .setParent(Context.current())
-                    .setAttribute("jenkins.pipeline.step.type", stepStartNode.getDisplayFunctionName())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE, stepStartNode.getDisplayFunctionName())
+                    .setAttribute(JenkinsOtelSemanticAttributes.JENKINS_STEP_ID, stepStartNode.getId())
                     .startSpan();
             LOGGER.log(Level.FINE, () -> run.getFullDisplayName() + " - > " + stepStartNode.getDisplayFunctionName() + " - begin " + OtelUtils.toDebugString(atomicStepSpan));
 

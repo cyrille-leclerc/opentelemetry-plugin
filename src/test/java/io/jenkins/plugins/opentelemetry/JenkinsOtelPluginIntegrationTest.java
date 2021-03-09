@@ -5,13 +5,17 @@
 
 package io.jenkins.plugins.opentelemetry;
 
+import com.github.rutledgepaulv.prune.Tree;
+import com.google.common.base.Preconditions;
 import hudson.ExtensionList;
 import hudson.Functions;
 import hudson.model.Result;
 import io.jenkins.plugins.casc.misc.ConfiguredWithCode;
 import io.jenkins.plugins.casc.misc.JenkinsConfiguredWithCodeRule;
+import io.jenkins.plugins.opentelemetry.semconv.JenkinsOtelSemanticAttributes;
 import io.jenkins.plugins.opentelemetry.semconv.JenkinsSemanticMetrics;
 import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
@@ -19,6 +23,7 @@ import io.opentelemetry.sdk.metrics.data.MetricDataType;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricExporter;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.data.SpanData;
+import jenkins.model.Jenkins;
 import org.hamcrest.CoreMatchers;
 import org.hamcrest.MatcherAssert;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
@@ -27,9 +32,12 @@ import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.junit.*;
 import org.jvnet.hudson.test.BuildWatcher;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiPredicate;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
@@ -96,7 +104,7 @@ public class JenkinsOtelPluginIntegrationTest {
         String pipelineScript = "def xsh(cmd) {if (isUnix()) {sh cmd} else {bat cmd}};\n" +
                 "node() {\n" +
                 "    stage('ze-stage1') {\n" +
-                "       xsh 'echo ze-echo' \n" +
+                "       xsh (label: 'shell-1', script: 'echo ze-echo') \n" +
                 "    }\n" +
                 "    stage('ze-stage2') {\n" +
                 "       xsh 'echo ze-echo-2' \n" +
@@ -253,38 +261,127 @@ public class JenkinsOtelPluginIntegrationTest {
                 "node() {\n" +
                 "    stage('ze-parallel-stage') {\n" +
                 "        parallel parallelBranch1: {\n" +
-                "            xsh 'echo this-is-the-parallel-branch-1'\n" +
+                "            stage('ze-parallel-stage-1') {\n" +
+                "                xsh 'echo this-is-the-parallel-branch-1'\n" +
+                "            }\n" +
                 "        } ,parallelBranch2: {\n" +
-                "            xsh 'echo this-is-the-parallel-branch-2'\n" +
+                "            stage('ze-parallel-stage-2') {\n" +
+                "                xsh 'echo this-is-the-parallel-branch-2'\n" +
+                "            }\n" +
                 "        } ,parallelBranch3: {\n" +
-                "            xsh 'echo this-is-the-parallel-branch-3'\n" +
+                "            stage('ze-parallel-stage-3') {\n" +
+                "                xsh 'echo this-is-the-parallel-branch-3'\n" +
+                "            }\n" +
                 "        }\n" +
                 "    }\n" +
                 "}";
+        System.out.println(pipelineScript);
         WorkflowJob pipeline = jenkinsRule.createProject(WorkflowJob.class, "test-pipeline-with-parallel-step" + jobNameSuffix.incrementAndGet());
         pipeline.setDefinition(new CpsFlowDefinition(pipelineScript, true));
         WorkflowRun build = jenkinsRule.assertBuildStatus(Result.SUCCESS, pipeline.scheduleBuild2(0));
 
         List<SpanData> finishedSpanItems = flush();
         dumpSpans(finishedSpanItems);
+        MatcherAssert.assertThat(finishedSpanItems.size(), CoreMatchers.is(14));
 
-        MatcherAssert.assertThat(finishedSpanItems.size(), CoreMatchers.is(11));
+        SpanData spanZeParallelStage = getSpanBySpanName("Stage: ze-parallel-stage", finishedSpanItems);
+        SpanData spanZeParallelBranch1 = getSpanBySpanName("Parallel branch: parallelBranch1", finishedSpanItems);
+        SpanData spanZeParallelStage1 = getSpanBySpanName("Stage: ze-parallel-stage-1", finishedSpanItems);
+
+        SpanData actualParentOfSpanZeParallelBranch1 = getSpanBySpanId(spanZeParallelBranch1.getParentSpanId(), finishedSpanItems);
+        SpanData expectedParentOfSpanZeParallelBranch = spanZeParallelStage;
+        SpanData actualParentOfSpanZeParallelStage1 = getSpanBySpanId(spanZeParallelStage1.getParentSpanId(), finishedSpanItems);
+        SpanData expectedParentOfSpanZeParallelStage1 = spanZeParallelBranch1;
+
+        System.out.println("####");
+        System.out.println("Parent of span ZeParallelBranch1:");
+        System.out.println("\tactual:\t\t" + actualParentOfSpanZeParallelBranch1.getName() + "\t\t\t\t\t\t" + actualParentOfSpanZeParallelBranch1);
+        System.out.println("\texpected:\t" + expectedParentOfSpanZeParallelBranch.getName() + "\t\t\t\t\t\t" + expectedParentOfSpanZeParallelBranch);
+
+        System.out.println("####");
+        System.out.println("Parent of span ZeParallelStage1:");
+        System.out.println("\tactual:\t\t" + actualParentOfSpanZeParallelStage1.getName() + "\t\t\t\t\t\t" + actualParentOfSpanZeParallelStage1);
+        System.out.println("\texpected:\t" + expectedParentOfSpanZeParallelStage1.getName() + "\t\t\t\t\t\t" + expectedParentOfSpanZeParallelStage1);
+
+        System.out.println(jenkinsRule.jenkins.getRootUrl());
+        //Thread.sleep(TimeUnit.MILLISECONDS.convert(10, TimeUnit.MINUTES));
+        Assert.assertEquals(spanZeParallelStage1.getParentSpanId(), spanZeParallelBranch1.getSpanId());
+        Assert.assertEquals(spanZeParallelBranch1.getParentSpanId(), spanZeParallelStage.getSpanId());
+    }
+
+
+    public void verifyChainOfSpansFromAncestorToDescendants(List<String> expectedChainOfSpanNameFromAncestorToDescendant, List<SpanData> allSpans) {
 
     }
 
-    protected void dumpSpans(List<SpanData> finishedSpanItems) {
-        System.out.println(finishedSpanItems.size());
-        List<String> spansAsString = finishedSpanItems.stream().map(spanData ->
-                "   " + spanData.getStartEpochNanos() + " - " + spanData.getName() + ", id: " + spanData.getSpanId() + ", parentId: " + spanData.getParentSpanId() + ", attributes: " + spanData.getAttributes().asMap()
-        ).collect(Collectors.toList());
-        Collections.sort(spansAsString);
+    @Nonnull
+    public SpanData getSpanBySpanName(String spanName, List<SpanData> spans) throws Exception {
+        for (SpanData span : spans) {
+            if (Objects.equals(span.getName(), spanName)) {
+                return span;
+            }
+        }
+        throw new Exception("Span '" + spanName + "' not found");
+    }
 
-        System.out.println(spansAsString.stream().collect(Collectors.joining(", \n")));
+    @Nonnull
+    public SpanData getSpanBySpanId(String spanId, List<SpanData> spans) throws Exception {
+        for (SpanData span : spans) {
+            if (Objects.equals(span.getSpanId(), spanId)) {
+                return span;
+            }
+        }
+        throw new Exception("Span with id '" + spanId + "' not found");
+    }
+
+    protected void dumpSpans(List<SpanData> spans) {
+        // System.out.println(spans.size());
+        // List<String> spansAsString = spans.stream().map(spanData ->
+        //         "   " + spanData.getStartEpochNanos() + " - " + spanData.getName() + ", id: " + spanData.getSpanId() + ", parentId: " + spanData.getParentSpanId() + ", attributes: " + spanData.getAttributes().asMap()
+        // ).collect(Collectors.toList());
+        // Collections.sort(spansAsString);
+        //
+        // System.out.println(spansAsString.stream().collect(Collectors.joining(", \n")));
+
+
+        final BiPredicate<Tree.Node<SpanDataWrapper>, Tree.Node<SpanDataWrapper>> parentChildMatcher = (spanDataNode1, spanDataNode2) -> {
+            final SpanData spanData1 = spanDataNode1.getData().spanData;
+            final SpanData spanData2 = spanDataNode2.getData().spanData;
+            return Objects.equals(spanData1.getSpanId(), spanData2.getParentSpanId());
+        };
+        final List<Tree<SpanDataWrapper>> trees = Tree.of(spans.stream().map(span -> new SpanDataWrapper(span)).collect(Collectors.toList()), parentChildMatcher);
+        System.out.println("## TREE VIEW OF SPANS ## ");
+        for(Tree<SpanDataWrapper> tree: trees) {
+            System.out.println(tree);
+        }
+
     }
 
     @AfterClass
     public static void afterClass() {
         GlobalOpenTelemetry.resetForTest();
+    }
+
+    static class SpanDataWrapper {
+        final SpanData spanData;
+
+        public SpanDataWrapper(SpanData spanData) {
+            this.spanData = spanData;
+        }
+
+        @Override
+        public String toString() {
+             String result = spanData.getName();
+
+            final Attributes attributes = spanData.getAttributes();
+            if (attributes.get(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE) != null) {
+                result += ", function: " +  attributes.get(JenkinsOtelSemanticAttributes.JENKINS_STEP_TYPE);
+            }
+            if (attributes.get(JenkinsOtelSemanticAttributes.JENKINS_STEP_ID) != null) {
+                result += ", id: " +  attributes.get(JenkinsOtelSemanticAttributes.JENKINS_STEP_ID);
+            }
+            return result;
+        }
     }
 
 }
